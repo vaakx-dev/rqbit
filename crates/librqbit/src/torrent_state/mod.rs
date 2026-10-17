@@ -40,7 +40,7 @@ use tracing::warn;
 use crate::Session;
 use crate::chunk_tracker::ChunkTracker;
 use crate::file_info::FileInfo;
-use crate::limits::LimitsConfig;
+use crate::limits::{Limits, LimitsConfig};
 use crate::session::TorrentId;
 use crate::spawn_utils::BlockingSpawner;
 use crate::storage::BoxStorageFactory;
@@ -114,7 +114,6 @@ pub(crate) struct ManagedTorrentOptions {
     pub peer_read_write_timeout: Option<Duration>,
     pub allow_overwrite: bool,
     pub output_folder: PathBuf,
-    pub ratelimits: LimitsConfig,
     pub initial_peers: Vec<SocketAddr>,
     pub peer_limit: Option<usize>,
     #[cfg(feature = "disable-upload")]
@@ -186,6 +185,8 @@ pub struct ManagedTorrentShared {
     pub peer_id: Id20,
     pub span: tracing::Span,
     pub(crate) options: ManagedTorrentOptions,
+    // Can be changed at runtime with ManagedTorrent::set_ratelimits().
+    pub(crate) ratelimits: Limits,
     pub(crate) connector: Arc<StreamConnector>,
     pub(crate) storage_factory: BoxStorageFactory,
     pub(crate) session: Weak<Session>,
@@ -212,6 +213,16 @@ pub struct ManagedTorrent {
 }
 
 impl ManagedTorrent {
+    /// Change this torrent's download and upload limits, taking effect right away.
+    pub fn set_ratelimits(&self, limits: LimitsConfig) {
+        self.shared.ratelimits.set_download_bps(limits.download_bps);
+        self.shared.ratelimits.set_upload_bps(limits.upload_bps);
+    }
+
+    pub fn ratelimits(&self) -> LimitsConfig {
+        self.shared.ratelimits.get_config()
+    }
+
     pub fn id(&self) -> TorrentId {
         self.shared.id
     }

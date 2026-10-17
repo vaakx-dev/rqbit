@@ -1352,12 +1352,12 @@ impl Session {
                     peer_read_write_timeout: peer_opts.read_write_timeout,
                     allow_overwrite: opts.overwrite,
                     output_folder,
-                    ratelimits: opts.ratelimits,
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
                     #[cfg(feature = "disable-upload")]
                     _disable_upload: self._disable_upload,
                 },
+                ratelimits: Limits::new(opts.ratelimits),
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),
                 magnet_name: name,
