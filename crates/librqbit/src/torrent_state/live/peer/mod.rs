@@ -349,8 +349,14 @@ impl LivePeerState {
         self.time_critical_requests_added.clone()
     }
 
+    // Skips the chunks this peer was already asked for, e.g. by its own chunk requester.
     pub fn pop_time_critical_request(&mut self) -> Option<ChunkInfo> {
-        self.time_critical_requests.pop_front()
+        while let Some(chunk) = self.time_critical_requests.pop_front() {
+            if !self.inflight_requests.contains(&chunk) {
+                return Some(chunk);
+            }
+        }
+        None
     }
 
     // Returns true if there were any, so that the scheduler gives them to other peers.

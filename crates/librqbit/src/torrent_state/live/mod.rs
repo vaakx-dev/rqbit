@@ -807,9 +807,11 @@ impl TorrentStateLive {
     }
 
     pub(crate) fn update_only_files(&self, only_files: &HashSet<usize>) -> anyhow::Result<()> {
-        let mut g = self.lock_write("update_only_files");
-        let pt = g.get_pieces_mut()?;
-        let hns = pt.update_only_files(&self.metadata.file_infos, only_files)?;
+        // Release the state lock before touching the peers: peer tasks lock a peer and then the state.
+        let hns = self
+            .lock_write("update_only_files")
+            .get_pieces_mut()?
+            .update_only_files(&self.metadata.file_infos, only_files)?;
         if !hns.finished() {
             self.reconnect_all_not_needed_peers();
         }
@@ -1715,12 +1717,12 @@ impl PeerHandler {
                 Some(true) => {}
                 Some(false) => {
                     // This request was already in-flight for this peer for this chunk.
-                    // This might happen in theory, but not very likely.
                     //
-                    // Example:
-                    // someone stole a piece from us, and then died, the piece became "needed" again, and we reserved it
-                    // all before the piece request was processed by us.
-                    warn!(
+                    // Examples:
+                    // - someone stole a piece from us, and then died, the piece became "needed" again, and we reserved it
+                    //   all before the piece request was processed by us.
+                    // - the time-critical scheduler gave us a chunk of our own piece that we were about to request.
+                    debug!(
                         id = self.state.shared.id,
                         info_hash = ?self.state.shared.info_hash,
                         addr = ?self.addr,
