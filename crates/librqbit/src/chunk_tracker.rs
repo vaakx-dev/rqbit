@@ -269,6 +269,27 @@ impl ChunkTracker {
         }
     }
 
+    // Puts a needed piece back into the queue, keeping the chunks that were already written.
+    pub fn requeue_piece_if_needed(&mut self, index: ValidPieceIndex) {
+        if !self.is_piece_have(index) && self.selected[index.get_usize()] {
+            self.queue_pieces.set(index.get() as usize, true);
+        }
+    }
+
+    pub fn is_chunk_downloaded(&self, chunk: &ChunkInfo) -> bool {
+        self.chunk_status
+            .get(chunk.absolute_index as usize)
+            .map(|b| *b)
+            .unwrap_or(false)
+    }
+
+    // True once every chunk was written, including while the piece is being hash checked.
+    pub fn are_all_chunks_downloaded(&self, index: ValidPieceIndex) -> bool {
+        self.chunk_status
+            .get(self.lengths.chunk_range(index))
+            .is_some_and(|s| s.all())
+    }
+
     pub fn mark_piece_downloaded(&mut self, idx: ValidPieceIndex) {
         let id = idx.get() as usize;
         if !self.have.as_slice()[id] {

@@ -15,8 +15,13 @@ pub struct PieceTracker {
 }
 
 pub struct InflightPiece {
-    pub peer: PeerHandle,     // Which peer "owns" this piece
+    pub owner: PieceOwner,    // Who requests the missing chunks
     pub started: Instant,     // When download started (for steal threshold)
+}
+
+pub enum PieceOwner {
+    Peer(PeerHandle),                  // That peer's chunk requester asks it for every missing chunk
+    TimeCritical(TimeCriticalPiece),   // The time-critical scheduler spreads them over the fastest peers
 }
 ```
 
@@ -26,6 +31,7 @@ Key methods that maintain invariants:
 - `mark_piece_hash_ok()` - Mark as completed after hash verification
 - `mark_piece_hash_failed()` - Requeue after hash failure
 - `release_pieces_owned_by()` - Release all pieces owned by a dead peer
+- `make_time_critical()` / `release_time_critical()` - Hand a piece to the time-critical scheduler and back
 
 ### 2. `ChunkTracker` (in `chunk_tracker.rs`)
 
@@ -70,9 +76,12 @@ These are **disjoint** - a piece is never in multiple states simultaneously. Thi
 
 ### Chunk-Piece Consistency
 
-If `inflight_requests` contains chunks for piece P, then:
-- `inflight[P].peer` should equal this peer's address
-- OR the piece was just stolen (transient state during steal)
+Chunks of piece P may be requested from several peers: the owner, a peer it was stolen from
+(until the cancel is processed), or any peers the time-critical scheduler picked.
+A received chunk is written if P is in-flight and the chunk isn't written yet, whoever sent it.
+The writer holds the per-piece read lock; the peer that writes the last chunk takes the piece
+out of `inflight` and then takes the per-piece write lock for the hash check, so that no write
+to the piece can still be running.
 
 ## State Transitions
 
@@ -88,9 +97,10 @@ QUEUED → IN_FLIGHT → COMPLETED
    - Inserts into `inflight[p] = (peer, now)`
    - Returns `AcquireResult::Reserved(p)` or `AcquireResult::Stolen { piece, from_peer }`
 
-2. Chunk requesting:
-   - For each chunk in piece, insert into `inflight_requests`
-   - Send Request message to peer
+2. Chunk requesting (one chunk at a time, by the peer's chunk requester):
+   - Time-critical chunks the scheduler gave to this peer first
+   - Then the next chunk of its own piece that isn't written yet, as long as it still owns the piece
+   - Insert into `inflight_requests`, send Request message to peer
 
 3. Data arrival (`on_incoming_piece`):
    - Remove chunk from `inflight_requests`
@@ -118,9 +128,10 @@ Caller then:
 5. Calls `peers.on_steal(from_peer, to_peer, piece)`:
    - Sends Cancel messages to victim peer
    - Removes chunks from victim's `inflight_requests`
-6. Stealer requests chunks:
+6. Stealer requests the chunks that aren't written yet:
    - Inserts into own `inflight_requests`
    - Sends Request messages
+7. The victim's chunk requester stops requesting chunks of the piece once it sees it no longer owns it
 
 **Note:** Stealing does NOT call `reserve_needed_piece()` because the piece is already in `inflight`, not in `queue_pieces`.
 
@@ -135,9 +146,9 @@ IN_FLIGHT → QUEUED (for pieces owned by dead peer)
    - Calls `PieceTracker::release_pieces_owned_by(peer_addr)`
 
 2. `release_pieces_owned_by()`:
-   - Removes all entries from `inflight` where `peer == dead_peer_addr`
-   - For each removed piece, calls `chunks.mark_piece_broken_if_not_have(piece)`
-   - This sets `queue_pieces[p] = true` and clears `chunk_status` for piece
+   - Removes all entries from `inflight` owned by the dead peer
+   - For each removed piece, calls `chunks.requeue_piece_if_needed(piece)`
+   - This sets `queue_pieces[p] = true` and keeps `chunk_status`, so only missing chunks are downloaded again
    - Returns count of released pieces
 
 This maintains the invariant: pieces transition cleanly from IN_FLIGHT → QUEUED.
@@ -228,3 +239,20 @@ Care must be taken when modifying state transition logic to maintain this orderi
 3. **Try steal (3x threshold)** - Moderately slow peers as fallback
 
 This balances fairness with efficiency - we prefer reserving new pieces but will steal from slow peers to avoid bottlenecks.
+
+Time-critical pieces are never stolen.
+
+### Time-Critical Flow
+
+```
+QUEUED or IN_FLIGHT (peer A) → IN_FLIGHT (time critical) → COMPLETED
+```
+
+See `time_critical/mod.rs`, which follows libtorrent's streaming design:
+1. The pieces under each stream's read position are handed to the scheduler with `make_time_critical()`.
+   Peer A keeps its outstanding requests but stops requesting more.
+2. Each pass, the missing chunks nobody was asked for go to the peers with the lowest download queue time,
+   earliest deadline first, through the peers' `time_critical_requests` queues.
+3. A piece that takes longer than the average time-critical piece gets its chunks requested again from other
+   peers. When one copy arrives, the duplicate requests are cancelled.
+4. When the streams move away, a piece without outstanding requests goes back to the queue with `release_time_critical()`.

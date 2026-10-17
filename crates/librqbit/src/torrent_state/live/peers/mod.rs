@@ -1,7 +1,7 @@
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
 use dashmap::DashMap;
-use librqbit_core::lengths::ValidPieceIndex;
+use librqbit_core::lengths::{ChunkInfo, ValidPieceIndex};
 use parking_lot::RwLock;
 
 use crate::{
@@ -138,6 +138,20 @@ impl PeerStates {
             peer.set_not_needed(self)
         })?;
         Some(prev)
+    }
+
+    // Another peer delivered the chunk, so the requests for it to everyone else are useless.
+    pub(crate) fn cancel_duplicate_requests(&self, chunk: &ChunkInfo, delivered_by: PeerHandle) {
+        for mut peer in self.states.iter_mut() {
+            if *peer.key() == delivered_by {
+                continue;
+            }
+            if let Some(live) = peer.value_mut().get_live_mut()
+                && live.has_requested(chunk)
+            {
+                live.cancel_request(chunk);
+            }
+        }
     }
 
     pub(crate) fn on_steal(

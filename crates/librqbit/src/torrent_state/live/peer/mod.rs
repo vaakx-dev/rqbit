@@ -1,8 +1,10 @@
+pub mod download_rate;
 pub mod stats;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, atomic::Ordering};
+use std::time::Instant;
 
 use librqbit_core::hash_id::Id20;
 use librqbit_core::lengths::{ChunkInfo, ValidPieceIndex};
@@ -18,7 +20,10 @@ use crate::peer_connection::WriterRequest;
 use crate::stream_connect::ConnectionKind;
 use crate::type_aliases::BF;
 
+use self::download_rate::DownloadRate;
 use super::PeerStates;
+
+pub(crate) const DEFAULT_PEER_REQUEST_WINDOW: usize = 128;
 
 pub(crate) type InflightRequest = ChunkInfo;
 pub(crate) type PeerRx = UnboundedReceiver<WriterRequest>;
@@ -88,6 +93,7 @@ impl Peer {
 }
 
 #[derive(Debug, Default)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum PeerState {
     #[default]
     // Will be tried to be connected as soon as possible.
@@ -263,6 +269,14 @@ pub(crate) struct LivePeerState {
     // When the peer sends us data this is used to track if we asked for it.
     inflight_requests: HashSet<InflightRequest>,
 
+    // Chunks of time-critical pieces the scheduler gave to this peer, sent before anything else.
+    time_critical_requests: VecDeque<ChunkInfo>,
+    time_critical_requests_added: Arc<Notify>,
+
+    pub i_am_choked: bool,
+    pub request_window: usize,
+    pub download_rate: DownloadRate,
+
     // Bounded tolerance for chunks that arrive after we cancel requests.
     // This is intentionally approximate: we track a count instead of storing every
     // canceled chunk, so a peer is not disconnected for racing our cancel messages.
@@ -289,6 +303,11 @@ impl LivePeerState {
             peer_interested: initial_interested,
             bitfield: BF::default(),
             inflight_requests: Default::default(),
+            time_critical_requests: Default::default(),
+            time_critical_requests_added: Default::default(),
+            i_am_choked: true,
+            request_window: DEFAULT_PEER_REQUEST_WINDOW,
+            download_rate: Default::default(),
             late_cancelled_request_tolerance: 0,
             request_slots_changed: Default::default(),
             tx,
@@ -304,16 +323,52 @@ impl LivePeerState {
         self.request_slots_changed.clone()
     }
 
-    pub fn requested_inflight_count(&self) -> usize {
-        self.inflight_requests.len()
+    pub fn can_send_request(&self) -> bool {
+        !self.i_am_choked && self.inflight_requests.len() < self.request_window
+    }
+
+    // Requests sent and not answered yet plus the time-critical ones waiting to be sent.
+    pub fn outstanding_requests(&self) -> usize {
+        self.inflight_requests.len() + self.time_critical_requests.len()
+    }
+
+    pub fn has_requested(&self, chunk: &ChunkInfo) -> bool {
+        self.inflight_requests.contains(chunk) || self.time_critical_requests.contains(chunk)
     }
 
     pub fn add_inflight_request(&mut self, chunk: ChunkInfo) -> bool {
         self.inflight_requests.insert(chunk)
     }
 
+    pub fn push_time_critical_request(&mut self, chunk: ChunkInfo) {
+        self.time_critical_requests.push_back(chunk);
+        self.time_critical_requests_added.notify_waiters();
+    }
+
+    pub fn time_critical_requests_added(&self) -> Arc<Notify> {
+        self.time_critical_requests_added.clone()
+    }
+
+    pub fn pop_time_critical_request(&mut self) -> Option<ChunkInfo> {
+        self.time_critical_requests.pop_front()
+    }
+
+    // Returns true if there were any, so that the scheduler gives them to other peers.
+    pub fn clear_time_critical_requests(&mut self) -> bool {
+        let had_any = !self.time_critical_requests.is_empty();
+        self.time_critical_requests.clear();
+        had_any
+    }
+
+    pub fn iter_outstanding_requests(&self) -> impl Iterator<Item = &ChunkInfo> {
+        self.inflight_requests
+            .iter()
+            .chain(self.time_critical_requests.iter())
+    }
+
     pub fn remove_inflight_request(&mut self, chunk: &ChunkInfo) -> RemoveInflightRequestResult {
         if self.inflight_requests.remove(chunk) {
+            self.download_rate.on_payload(chunk.size, Instant::now());
             self.request_slots_changed.notify_waiters();
             return RemoveInflightRequestResult::Expected;
         }
@@ -347,6 +402,25 @@ impl LivePeerState {
         });
 
         if self.inflight_requests.len() != before {
+            self.request_slots_changed.notify_waiters();
+        }
+    }
+
+    // Drop a duplicate request for a chunk that another peer delivered.
+    pub fn cancel_request(&mut self, chunk: &ChunkInfo) {
+        if let Some(pos) = self.time_critical_requests.iter().position(|c| c == chunk) {
+            self.time_critical_requests.remove(pos);
+            return;
+        }
+        if self.inflight_requests.remove(chunk) {
+            let _ = self
+                .tx
+                .send(WriterRequest::Message(Message::Cancel(Request {
+                    index: chunk.piece_index.get(),
+                    begin: chunk.offset,
+                    length: chunk.size,
+                })));
+            self.late_cancelled_request_tolerance += 1;
             self.request_slots_changed.notify_waiters();
         }
     }

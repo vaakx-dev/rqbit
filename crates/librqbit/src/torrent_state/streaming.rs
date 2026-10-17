@@ -15,8 +15,9 @@ use dashmap::DashMap;
 use librqbit_core::lengths::{CurrentPiece, Lengths, ValidPieceIndex};
 use tokio::{
     io::{AsyncRead, AsyncSeek},
-    sync::OwnedSemaphorePermit,
+    sync::{Notify, futures::Notified},
 };
+use tokio_util::sync::PollSemaphore;
 use tracing::{debug, trace};
 
 use crate::{ManagedTorrent, file_info::FileInfo, storage::TorrentStorage};
@@ -27,6 +28,9 @@ type StreamId = usize;
 
 // 32 mb lookahead by default.
 const PER_STREAM_BUF_DEFAULT: u64 = 32 * 1024 * 1024;
+
+// The part of the lookahead right under the read position that has a deadline.
+const PER_STREAM_TIME_CRITICAL: u64 = 8 * 1024 * 1024;
 
 struct StreamState {
     file_id: usize,
@@ -41,9 +45,13 @@ impl StreamState {
         lengths.compute_current_piece(self.position, self.file_abs_offset)
     }
 
-    fn queue<'a>(&self, lengths: &'a Lengths) -> impl Iterator<Item = ValidPieceIndex> + use<'a> {
+    fn queue<'a>(
+        &self,
+        lengths: &'a Lengths,
+        lookahead: u64,
+    ) -> impl Iterator<Item = ValidPieceIndex> + use<'a> {
         let start = self.file_abs_offset + self.position;
-        let end = (start + PER_STREAM_BUF_DEFAULT).min(self.file_abs_offset + self.file_len);
+        let end = (start + lookahead).min(self.file_abs_offset + self.file_len);
         let dpl = lengths.default_piece_length();
         let start_id = (start / dpl as u64).try_into().unwrap();
         let end_id = end.div_ceil(dpl as u64).try_into().unwrap();
@@ -51,10 +59,29 @@ impl StreamState {
     }
 }
 
+struct Interleave<I> {
+    all: VecDeque<I>,
+}
+
+impl<I: Iterator<Item = ValidPieceIndex>> Iterator for Interleave<I> {
+    type Item = ValidPieceIndex;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(mut it) = self.all.pop_front() {
+            if let Some(piece) = it.next() {
+                self.all.push_back(it);
+                return Some(piece);
+            }
+        }
+        None
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct TorrentStreams {
     next_stream_id: AtomicUsize,
     streams: DashMap<StreamId, StreamState>,
+    deadlines_changed: Notify,
 }
 
 impl TorrentStreams {
@@ -74,31 +101,38 @@ impl TorrentStreams {
         &'a self,
         lengths: &'a Lengths,
     ) -> impl Iterator<Item = ValidPieceIndex> + 'a {
-        struct Interleave<I> {
-            all: VecDeque<I>,
-        }
-
-        impl<I: Iterator<Item = ValidPieceIndex>> Iterator for Interleave<I> {
-            type Item = ValidPieceIndex;
-
-            fn next(&mut self) -> Option<Self::Item> {
-                while let Some(mut it) = self.all.pop_front() {
-                    if let Some(piece) = it.next() {
-                        self.all.push_back(it);
-                        return Some(piece);
-                    }
-                }
-                None
-            }
-        }
-
-        let mut all: Vec<_> = self.streams.iter().map(|s| s.queue(lengths)).collect();
+        let mut all: Vec<_> = self
+            .streams
+            .iter()
+            .map(|s| s.queue(lengths, PER_STREAM_BUF_DEFAULT))
+            .collect();
 
         // Shuffle to decrease determinism and make queueing fairer.
         use rand::seq::SliceRandom;
         all.shuffle(&mut rand::rng());
 
         Interleave { all: all.into() }
+    }
+
+    // Pieces right under the read position of each stream, earliest deadline first.
+    pub(crate) fn iter_time_critical_pieces<'a>(
+        &'a self,
+        lengths: &'a Lengths,
+    ) -> impl Iterator<Item = ValidPieceIndex> + 'a {
+        let all: VecDeque<_> = self
+            .streams
+            .iter()
+            .map(|s| s.queue(lengths, PER_STREAM_TIME_CRITICAL))
+            .collect();
+        Interleave { all }
+    }
+
+    pub(crate) fn deadlines_changed(&self) -> Notified<'_> {
+        self.deadlines_changed.notified()
+    }
+
+    fn on_deadlines_changed(&self) {
+        self.deadlines_changed.notify_waiters();
     }
 
     pub(crate) fn wake_streams_on_piece_completed(
@@ -122,7 +156,9 @@ impl TorrentStreams {
 
     fn drop_stream(&self, stream_id: StreamId) -> Option<StreamState> {
         debug!(stream_id, "dropping stream");
-        self.streams.remove(&stream_id).map(|s| s.1)
+        let removed = self.streams.remove(&stream_id).map(|s| s.1);
+        self.on_deadlines_changed();
+        removed
     }
 
     pub(crate) fn streamed_file_ids(&self) -> impl Iterator<Item = usize> + '_ {
@@ -142,7 +178,7 @@ pub struct FileStream {
     file_len: u64,
     file_torrent_abs_offset: u64,
 
-    _blocking_permit: OwnedSemaphorePermit,
+    blocking_permits: PollSemaphore,
 }
 
 macro_rules! map_io_err {
@@ -213,6 +249,12 @@ impl AsyncRead for FileStream {
         );
 
         let buf = &mut buf[..bytes_to_read];
+
+        // Only hold a blocking slot for the read itself, never while waiting for pieces.
+        let _permit = poll_try_io!(
+            std::task::ready!(self.blocking_permits.poll_acquire(cx))
+                .context("blocking semaphore closed")
+        );
 
         let start = Instant::now();
         poll_try_io!(poll_try_io!(self.torrent.shared.spawner.block_in_place(
@@ -345,7 +387,6 @@ impl ManagedTorrent {
             &metadata,
         )?;
         let streams = self.streams()?;
-        let blocking_permit = self.shared().spawner.semaphore().acquire_owned().await?;
         let s = FileStream {
             stream_id: streams.next_id(),
             streams: streams.clone(),
@@ -354,7 +395,7 @@ impl ManagedTorrent {
 
             file_len: fd_len,
             file_torrent_abs_offset: fd_offset,
-            _blocking_permit: blocking_permit,
+            blocking_permits: PollSemaphore::new(self.shared().spawner.semaphore()),
             torrent: self,
             metadata,
         };
@@ -369,6 +410,7 @@ impl ManagedTorrent {
                 file_abs_offset: fd_offset,
             },
         );
+        streams.on_deadlines_changed();
 
         debug!(stream_id = s.stream_id, file_id, "started stream");
 
@@ -386,6 +428,9 @@ impl FileStream {
     }
 
     fn set_position(&mut self, new_pos: u64) {
+        let piece_len = self.metadata.lengths().default_piece_length() as u64;
+        let piece_changed = (self.file_torrent_abs_offset + self.position) / piece_len
+            != (self.file_torrent_abs_offset + new_pos) / piece_len;
         self.position = new_pos;
         self.streams
             .streams
@@ -393,6 +438,9 @@ impl FileStream {
             .unwrap()
             .value_mut()
             .position = new_pos;
+        if piece_changed {
+            self.streams.on_deadlines_changed();
+        }
     }
 
     pub fn len(&self) -> u64 {

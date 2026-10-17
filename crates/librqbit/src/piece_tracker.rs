@@ -1,7 +1,8 @@
 //! Coordinates piece download state by wrapping ChunkTracker with inflight piece tracking.
 //!
 //! This module provides the [`PieceTracker`] type which encapsulates the relationship between
-//! queued pieces (in ChunkTracker) and in-flight pieces (being downloaded by a peer).
+//! queued pieces (in ChunkTracker) and in-flight pieces (being downloaded by one peer, or
+//! spread over many peers when the piece is time critical).
 //!
 //! The key invariant maintained is: a piece is in exactly one state at any time:
 //! - HAVE (completed)
@@ -24,11 +25,58 @@ use crate::{
     type_aliases::{FileInfos, FilePriorities, PeerHandle},
 };
 
+/// Who requests the chunks of an in-flight piece.
+#[derive(Debug, Clone)]
+pub enum PieceOwner {
+    /// The peer's chunk requester asks this peer for every missing chunk.
+    Peer(PeerHandle),
+    /// The time-critical scheduler spreads the missing chunks over the fastest peers.
+    TimeCritical(TimeCriticalPiece),
+}
+
+#[derive(Debug, Clone)]
+pub struct TimeCriticalPiece {
+    pub first_requested: Option<Instant>,
+    /// When a chunk nobody had asked for yet was last requested.
+    pub last_requested: Option<Instant>,
+    /// Some chunk was requested from more than one peer.
+    pub busy: bool,
+}
+
 /// Tracks a piece currently being downloaded.
 #[derive(Debug, Clone)]
 pub struct InflightPiece {
-    pub peer: PeerHandle,
+    pub owner: PieceOwner,
     pub started: Instant,
+}
+
+impl InflightPiece {
+    pub fn is_owned_by(&self, peer: PeerHandle) -> bool {
+        matches!(self.owner, PieceOwner::Peer(p) if p == peer)
+    }
+}
+
+/// Running average of how long time-critical pieces take, and of the deviation from it.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PieceTimes {
+    pub average: Duration,
+    pub deviation: Duration,
+}
+
+impl PieceTimes {
+    fn add(&mut self, sample: Duration) {
+        if self.average.is_zero() {
+            self.average = sample;
+            return;
+        }
+        let diff = self.average.abs_diff(sample);
+        self.deviation = if self.deviation.is_zero() {
+            diff
+        } else {
+            (self.deviation * 9 + diff) / 10
+        };
+        self.average = (self.average * 9 + sample) / 10;
+    }
 }
 
 /// Result of attempting to acquire a piece.
@@ -79,6 +127,7 @@ where
 pub struct PieceTracker {
     chunks: ChunkTracker,
     inflight: HashMap<ValidPieceIndex, InflightPiece>,
+    time_critical_times: PieceTimes,
 }
 
 impl PieceTracker {
@@ -89,6 +138,7 @@ impl PieceTracker {
         Self {
             chunks,
             inflight: HashMap::new(),
+            time_critical_times: PieceTimes::default(),
         }
     }
 
@@ -135,10 +185,11 @@ impl PieceTracker {
         // First check priority pieces that aren't already downloaded or in-flight
         for piece in &mut req.priority_pieces {
             if !self.chunks.is_piece_have(piece)
+                && !self.chunks.are_all_chunks_downloaded(piece)
                 && !self.inflight.contains_key(&piece)
                 && (req.peer_has_piece)(piece)
             {
-                return self.reserve_piece(piece, req.peer);
+                return self.reserve_piece(piece, PieceOwner::Peer(req.peer));
             }
         }
 
@@ -151,7 +202,7 @@ impl PieceTracker {
 
         for piece in queued {
             if (req.peer_has_piece)(piece) {
-                return self.reserve_piece(piece, req.peer);
+                return self.reserve_piece(piece, PieceOwner::Peer(req.peer));
             }
         }
 
@@ -164,12 +215,12 @@ impl PieceTracker {
     }
 
     /// Reserve a piece: remove from queue, add to inflight.
-    fn reserve_piece(&mut self, piece: ValidPieceIndex, peer: PeerHandle) -> AcquireResult {
+    fn reserve_piece(&mut self, piece: ValidPieceIndex, owner: PieceOwner) -> AcquireResult {
         self.chunks.reserve_needed_piece(piece);
         self.inflight.insert(
             piece,
             InflightPiece {
-                peer,
+                owner,
                 started: Instant::now(),
             },
         );
@@ -195,9 +246,12 @@ impl PieceTracker {
         let (piece, old_peer, _) = self
             .inflight
             .iter()
-            .filter(|(_, info)| info.peer != req.peer)
-            .filter(|(p, _)| (req.peer_has_piece)(**p))
-            .map(|(p, info)| (*p, info.peer, info.started.elapsed()))
+            .filter_map(|(p, info)| match info.owner {
+                PieceOwner::Peer(owner) if owner != req.peer => Some((*p, owner, info.started)),
+                _ => None,
+            })
+            .filter(|(p, _, _)| (req.peer_has_piece)(*p))
+            .map(|(p, owner, started)| (p, owner, started.elapsed()))
             .filter(|(_, _, elapsed)| *elapsed >= min_elapsed)
             .max_by_key(|(_, _, elapsed)| *elapsed)?;
 
@@ -208,7 +262,7 @@ impl PieceTracker {
 
         // Update ownership (piece stays in inflight, just changes owner)
         let info = self.inflight.get_mut(&piece)?;
-        info.peer = req.peer;
+        info.owner = PieceOwner::Peer(req.peer);
         info.started = Instant::now();
 
         Some(AcquireResult::Stolen {
@@ -226,6 +280,13 @@ impl PieceTracker {
     /// and then call `mark_piece_hash_ok` or `mark_piece_hash_failed`.
     pub fn take_inflight(&mut self, piece: ValidPieceIndex) -> Option<Duration> {
         let inflight = self.inflight.remove(&piece)?;
+        if let PieceOwner::TimeCritical(TimeCriticalPiece {
+            first_requested: Some(first_requested),
+            ..
+        }) = &inflight.owner
+        {
+            self.time_critical_times.add(first_requested.elapsed());
+        }
         Some(inflight.started.elapsed())
     }
 
@@ -241,23 +302,80 @@ impl PieceTracker {
 
     /// Release all pieces owned by a peer (on peer death).
     ///
-    /// Moves all pieces owned by the peer from IN_FLIGHT back to QUEUED.
+    /// Moves all pieces owned by the peer from IN_FLIGHT back to QUEUED, keeping
+    /// the chunks already written so that only the missing ones get downloaded again.
     /// Returns the number of pieces released.
     pub fn release_pieces_owned_by(&mut self, peer: PeerHandle) -> usize {
         // Collect pieces to release (can't modify while iterating)
         let pieces_to_release: Vec<_> = self
             .inflight
             .iter()
-            .filter(|(_, info)| info.peer == peer)
+            .filter(|(_, info)| info.is_owned_by(peer))
             .map(|(p, _)| *p)
             .collect();
 
         let count = pieces_to_release.len();
         for piece in pieces_to_release {
             self.inflight.remove(&piece);
-            self.chunks.mark_piece_broken_if_not_have(piece);
+            self.chunks.requeue_piece_if_needed(piece);
         }
         count
+    }
+
+    // === TIME-CRITICAL PIECES ===
+
+    /// Hand the piece to the time-critical scheduler, reserving it if it's queued.
+    ///
+    /// A previous owner's outstanding requests stay valid, it just stops requesting more.
+    /// Returns false if the piece is downloaded or being hash checked.
+    pub fn make_time_critical(&mut self, piece: ValidPieceIndex) -> bool {
+        let time_critical = || {
+            PieceOwner::TimeCritical(TimeCriticalPiece {
+                first_requested: None,
+                last_requested: None,
+                busy: false,
+            })
+        };
+        if let Some(inflight) = self.inflight.get_mut(&piece) {
+            if let PieceOwner::Peer(_) = inflight.owner {
+                inflight.owner = time_critical();
+            }
+            return true;
+        }
+        if self.chunks.is_piece_have(piece) || self.chunks.are_all_chunks_downloaded(piece) {
+            return false;
+        }
+        self.reserve_piece(piece, time_critical());
+        true
+    }
+
+    pub fn get_time_critical_mut(
+        &mut self,
+        piece: ValidPieceIndex,
+    ) -> Option<&mut TimeCriticalPiece> {
+        match &mut self.inflight.get_mut(&piece)?.owner {
+            PieceOwner::TimeCritical(tc) => Some(tc),
+            PieceOwner::Peer(_) => None,
+        }
+    }
+
+    pub fn iter_time_critical(&self) -> impl Iterator<Item = ValidPieceIndex> + '_ {
+        self.inflight
+            .iter()
+            .filter(|(_, info)| matches!(info.owner, PieceOwner::TimeCritical(_)))
+            .map(|(p, _)| *p)
+    }
+
+    /// Give a piece that is no longer time critical back to the queue, keeping its chunks.
+    pub fn release_time_critical(&mut self, piece: ValidPieceIndex) {
+        if self.get_time_critical_mut(piece).is_some() {
+            self.inflight.remove(&piece);
+            self.chunks.requeue_piece_if_needed(piece);
+        }
+    }
+
+    pub fn time_critical_times(&self) -> PieceTimes {
+        self.time_critical_times
     }
 
     // === QUERIES ===
@@ -796,7 +914,7 @@ mod tests {
                 assert_eq!(piece, piece_4, "Should steal piece 4 (the one peer B has)");
                 assert_eq!(from_peer, peer_a);
                 // Verify piece 0 is still owned by peer A (wasn't stolen)
-                assert_eq!(tracker.get_inflight(piece_0).unwrap().peer, peer_a);
+                assert!(tracker.get_inflight(piece_0).unwrap().is_owned_by(peer_a));
             }
             _ => panic!("Expected Stolen, got {:?}", result),
         }
