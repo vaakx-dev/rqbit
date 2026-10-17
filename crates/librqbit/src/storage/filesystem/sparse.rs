@@ -8,5 +8,19 @@ pub fn mark_file_sparse(f: &std::fs::File) -> bool {
 
     let handle = HANDLE(f.as_raw_handle());
 
-    unsafe { DeviceIoControl(handle, FSCTL_SET_SPARSE, None, 0, None, 0, None, None).is_ok() }
+    // Without an OVERLAPPED, DeviceIoControl requires somewhere to write the returned byte count.
+    let mut bytes_returned = 0u32;
+    unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_SET_SPARSE,
+            None,
+            0,
+            None,
+            0,
+            Some(&mut bytes_returned),
+            None,
+        )
+        .is_ok()
+    }
 }
